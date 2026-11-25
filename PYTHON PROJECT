@@ -1,0 +1,428 @@
+Mandi Rates - Best Market for Your Crop  (Python / Streamlit version)
+
+Tabs: Farmer view, Buyer requests, AI help, Weather (python-weather), Admin.
+Data is stored in a local SQLite file (mandi.db).
+
+Run:
+    pip install streamlit pandas python-weather anthropic
+    export ANTHROPIC_API_KEY=your_key        # needed only for the AI help tab
+    streamlit run mandi_app.py
+"""
+import asyncio
+import csv
+import hashlib
+import io
+import os
+import sqlite3
+from contextlib import contextmanager
+from datetime import date, datetime
+
+import pandas as pd
+import streamlit as st
+
+DB_PATH = os.environ.get("MANDI_DB", "mandi.db")
+# Same admin check as the web version: sha256("mandi:<login id>:<password>")
+ADMIN_HASH = os.environ.get(
+    "MANDI_ADMIN_HASH",
+    "3e595d835301c37b46cafa2cc1367ac5e5576f00cb68840728e98c97d0fa6a67",
+)
+AI_MODEL = os.environ.get("MANDI_AI_MODEL", "claude-sonnet-5-5")
+CITIES = ["Pune", "Nashik", "Nagpur"]
+
+SYSTEM_PROMPT = (
+    "You are a helpful assistant inside the Mandi Rates app for Maharashtra farmers. "
+    "Answer practical questions on crop care, pests and disease, storage, selling at mandis, "
+    "transport, MSP, government schemes and weather planning in short, simple steps. "
+    "Reply in the language the farmer writes in (English, Hindi or Marathi). "
+    "Use the app data below for price questions; if it does not have the answer, say so and "
+    "never invent prices. For pesticide doses, loans or legal matters, advise confirming with "
+    "the local Krishi Vigyan Kendra, bank or officer."
+)
+
+
+# ---------------------------------------------------------------- database
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS rates(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT NOT NULL, crop TEXT NOT NULL, market TEXT NOT NULL,
+    price REAL NOT NULL, change REAL DEFAULT 0, note TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS requests(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, phone TEXT, crop TEXT, qty REAL, price REAL, place TEXT,
+    status TEXT DEFAULT 'open', at TEXT);
+"""
+
+
+@contextmanager
+def db():
+    """Open, commit and always close the connection."""
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        con.executescript(SCHEMA)
+        yield con
+        con.commit()
+    finally:
+        con.close()
+
+
+def q(sql, args=()):
+    with db() as con:
+        return pd.read_sql_query(sql, con, params=args)
+
+
+def run(sql, args=()):
+    with db() as con:
+        con.execute(sql, args)
+
+
+def rs(n):
+    return f"₹{float(n):,.0f}"
+
+
+# ---------------------------------------------------------------- admin auth
+def check_login(login_id, password):
+    h = hashlib.sha256(f"mandi:{login_id.strip()}:{password}".encode()).hexdigest()
+    return h == ADMIN_HASH
+
+
+def is_admin():
+    return st.session_state.get("admin", False)
+
+
+# ---------------------------------------------------------------- helpers
+def latest_best(crop):
+    df = q(
+        "SELECT * FROM rates WHERE lower(crop)=lower(?) AND day=("
+        "SELECT MAX(day) FROM rates WHERE lower(crop)=lower(?)) ORDER BY price DESC LIMIT 1",
+        (crop, crop),
+    )
+    return None if df.empty else df.iloc[0]
+
+
+def parse_csv(text):
+    rows, bad = [], []
+    for i, line in enumerate(csv.reader(io.StringIO(text)), start=1):
+        if not line or not any(c.strip() for c in line):
+            continue
+        c = [x.strip() for x in line]
+        if i == 1 and "crop" in c[0].lower():
+            continue
+        try:
+            rows.append(
+                dict(
+                    crop=c[0],
+                    market=c[1],
+                    price=float(c[2]),
+                    change=float(c[3]) if len(c) > 3 and c[3] else 0.0,
+                    note=c[4] if len(c) > 4 else "",
+                )
+            )
+        except (IndexError, ValueError):
+            bad.append(i)
+    return rows, bad
+
+
+# ---------------------------------------------------------------- Farmer view
+def farmer_view():
+    st.subheader("Best market for your crop")
+    days = q("SELECT DISTINCT day FROM rates ORDER BY day DESC")["day"].tolist()
+    if not days:
+        st.info("Rates have not been published yet.")
+        return
+
+    c1, c2 = st.columns(2)
+    period = c1.radio("Period", ["Day", "Month", "Year"], horizontal=True)
+    if period == "Day":
+        pick = c2.selectbox("Date", days)
+        like = pick
+    elif period == "Month":
+        months = sorted({d[:7] for d in days}, reverse=True)
+        like = c2.selectbox("Month", months)
+    else:
+        years = sorted({d[:4] for d in days}, reverse=True)
+        like = c2.selectbox("Year", years)
+
+    df = q("SELECT * FROM rates WHERE day LIKE ?", (like + "%",))
+    if df.empty:
+        st.warning("No rates for this period.")
+        return
+
+    crop = st.selectbox("Crop", sorted(df["crop"].unique()))
+    d = df[df["crop"] == crop]
+    multi = period != "Day"
+
+    g = d.groupby("market").agg(price=("price", "mean"), lo=("price", "min"),
+                                hi=("price", "max"), n=("price", "size")).reset_index()
+    first_last = d.sort_values("day").groupby("market")["price"].agg(lambda s: s.iloc[-1] - s.iloc[0])
+    day_change = d.groupby("market")["change"].last()
+    g["change"] = g["market"].map(first_last if multi else day_change)
+    g["price"] = g["price"].round()
+    g = g.sort_values("price", ascending=False).reset_index(drop=True)
+
+    best, worst = g.iloc[0], g.iloc[-1]
+    diff = best["price"] - worst["price"]
+    st.success(f"*Best market for {crop}: {best['market']} — {rs(best['price'])}/quintal*")
+    if len(g) > 1:
+        st.write(f"Sell here instead of {worst['market']} and earn *{rs(diff)}* more per quintal.")
+        rise = g.sort_values("change", ascending=False).iloc[0]
+        drop = g.sort_values("change").iloc[0]
+        a, b = st.columns(2)
+        a.metric("Rising fastest", rise["market"], f"{rise['change']:+.0f}")
+        b.metric("Falling fastest", drop["market"], f"{drop['change']:+.0f}")
+
+    qty = st.number_input("How many quintals will you sell?", min_value=0.0, value=10.0, step=1.0)
+    st.write(f"At *{best['market']}* you get *{rs(qty * best['price'])}*"
+             + (f" — {rs(qty * diff)} more than at {worst['market']}." if len(g) > 1 else ".")
+             + "  (Before transport and mandi charges.)")
+
+    trend = d.groupby("day")["price"].mean()
+    if len(trend) > 1:
+        st.caption("Price trend (average of markets)")
+        st.line_chart(trend)
+
+    show = g.rename(columns={"market": "Market", "price": "₹ per quintal", "change": "Change"})
+    st.dataframe(show[["Market", "₹ per quintal", "Change"]], hide_index=True, width="stretch")
+
+
+# ---------------------------------------------------------------- Buyer requests
+def buyer_view():
+    st.subheader("Buyer requests")
+    st.caption("Buyers post what they want to buy and the price they will pay. Farmers see every open request.")
+
+    with st.form("buy", clear_on_submit=True):
+        st.write("*Request to buy* — your name and phone are shown to farmers so they can call you.")
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Your name")
+        phone = c2.text_input("Phone number")
+        crops = q("SELECT DISTINCT crop FROM rates ORDER BY crop")["crop"].tolist()
+        c3, c4, c5 = st.columns(3)
+        crop = c3.text_input("Crop", placeholder=", ".join(crops[:3]))
+        qty = c4.number_input("Quintals wanted", min_value=0.0, step=1.0)
+        price = c5.number_input("Your price ₹ per quintal", min_value=0.0, step=10.0)
+        place = st.text_input("Delivery place")
+        if st.form_submit_button("Post request"):
+            if not (name.strip() and phone.strip() and crop.strip() and qty > 0 and price > 0):
+                st.error("Please fill name, phone, crop, quantity and price.")
+            else:
+                run("INSERT INTO requests(name,phone,crop,qty,price,place,at) VALUES(?,?,?,?,?,?,?)",
+                    (name.strip(), phone.strip(), crop.strip(), qty, price, place.strip(),
+                     datetime.now().isoformat(timespec="seconds")))
+                st.success("Request posted. Farmers can see it now.")
+
+    st.markdown("### Open buy requests  (₹ per quintal)")
+    reqs = q("SELECT * FROM requests WHERE status!='closed' ORDER BY at DESC")
+    if reqs.empty:
+        st.info("No open requests yet.")
+    for _, r in reqs.iterrows():
+        with st.container(border=True):
+            left, right = st.columns([3, 1])
+            b = latest_best(r["crop"])
+            badge = ""
+            if b is not None:
+                badge = f" — {'At/above' if r['price'] >= b['price'] else 'Below'} best mandi {rs(b['price'])}"
+            left.markdown(f"*{r['crop']} · {r['qty']:g} quintal*{badge}")
+            left.caption(f"{r['name']} · {r['phone']}" + (f" · {r['place']}" if r["place"] else ""))
+            right.markdown(f"### {rs(r['price'])}")
+            if is_admin():
+                a, c = st.columns(2)
+                if a.button("Mark closed", key=f"cl{r['id']}"):
+                    run("UPDATE requests SET status='closed' WHERE id=?", (int(r["id"]),))
+                    st.rerun()
+                if c.button("Delete", key=f"dl{r['id']}"):
+                    run("DELETE FROM requests WHERE id=?", (int(r["id"]),))
+                    st.rerun()
+    if not is_admin():
+        st.caption("Admins can log in under the Admin tab to close or delete requests.")
+
+
+# ---------------------------------------------------------------- AI help
+def app_context():
+    latest = q("SELECT MAX(day) d FROM rates").iloc[0]["d"]
+    rates = q("SELECT crop,market,price FROM rates WHERE day=? LIMIT 40", (latest,)) if latest else pd.DataFrame()
+    reqs = q("SELECT crop,qty,price FROM requests WHERE status!='closed' ORDER BY at DESC LIMIT 8")
+    r_txt = "; ".join(f"{r.crop} at {r.market} {r.price:.0f}" for r in rates.itertuples()) or "none published"
+    q_txt = "; ".join(f"{r.crop} {r.qty:g}q at Rs {r.price:.0f}" for r in reqs.itertuples()) or "none"
+    return (f"APP DATA\nLatest mandi rates ({latest or 'none'}, Rs per quintal): {r_txt}\n"
+            f"Open buyer requests: {q_txt}")
+
+
+def ai_view():
+    st.subheader("AI help")
+    st.caption("Ask about prices, pests, storage, selling, schemes or weather. "
+               "You can write in English, Hindi or Marathi.")
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key:
+        try:
+            key = st.secrets["ANTHROPIC_API_KEY"]
+        except Exception:
+            key = None
+    if not key:
+        st.warning("Set the ANTHROPIC_API_KEY environment variable to turn on AI help.")
+        return
+    try:
+        import anthropic
+    except ImportError:
+        st.error("Run: pip install anthropic")
+        return
+
+    chat = st.session_state.setdefault("chat", [])
+    for m in chat:
+        st.chat_message(m["role"]).write(m["content"])
+
+    prompt = st.chat_input("Type your question…")
+    if prompt:
+        chat.append({"role": "user", "content": prompt})
+        st.chat_message("user").write(prompt)
+        history = chat[-8:]
+        while history and history[0]["role"] != "user":  # API needs a user turn first
+            history = history[1:]
+        client = anthropic.Anthropic(api_key=key)
+        reply = None
+        with st.chat_message("assistant"):
+            try:
+                with client.messages.stream(
+                    model=AI_MODEL,
+                    max_tokens=1000,
+                    system=SYSTEM_PROMPT + "\n\n" + app_context(),
+                    messages=history,
+                ) as stream:
+                    reply = st.write_stream(stream.text_stream)
+            except Exception as e:  # network, key, rate limit...
+                st.error(f"Sorry, I could not answer that ({type(e)._name_}). Please try again.")
+        if reply:
+            chat.append({"role": "assistant", "content": reply})
+        else:
+            chat.pop()  # drop the unanswered question so history stays valid
+    st.caption("AI answers are general guidance and can be wrong. Confirm important decisions locally.")
+
+
+# ---------------------------------------------------------------- Weather (python-weather)
+@st.cache_data(ttl=1800, show_spinner="Getting forecast…")
+def fetch_weather(city):
+    import python_weather
+
+    if os.name == "nt":  # python-weather needs the selector loop on Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    async def go():
+        async with python_weather.Client(unit=python_weather.METRIC) as client:
+            f = await client.get(f"{city}, India")
+            days = []
+            for d in f:
+                rain = []
+                for h in d:
+                    v = getattr(h, "chances_of_rain", None)
+                    if v is None:
+                        v = getattr(h, "chance_of_rain", None)
+                    if v is not None:
+                        rain.append(int(v))
+                days.append(dict(date=d.date, high=d.highest_temperature, low=d.lowest_temperature,
+                                 rain=max(rain) if rain else None))
+            return dict(now=f.temperature, kind=str(f.kind), desc=f.description, days=days)
+
+    return asyncio.run(go())
+
+
+def weather_view():
+    st.subheader("Weather")
+    city = st.radio("Region", CITIES, horizontal=True)
+    try:
+        w = fetch_weather(city)
+    except Exception as e:
+        st.error(f"Could not get the forecast ({type(e)._name_}). Check your internet connection.")
+        return
+    st.metric(f"{city} now", f"{w['now']}°C", w["desc"])
+    rainy = any((x["rain"] or 0) >= 30 for x in w["days"][:3])
+    st.info("Rain is possible in the next 3 days: cover harvested produce and plan transport early."
+            if rainy else
+            "Dry weather for the next 3 days: good for harvesting, drying and moving produce to market.")
+    cols = st.columns(len(w["days"]))
+    for col, x in zip(cols, w["days"]):
+        col.markdown(f"*{x['date'].strftime('%a %d')}*")
+        col.markdown(f"{x['high']}° / {x['low']}°")
+        if x["rain"] is not None:
+            col.caption(f"{x['rain']}% rain")
+    st.caption("Live forecast via python-weather. Check a local forecast before you travel.")
+
+
+# ---------------------------------------------------------------- Admin
+def admin_view():
+    st.subheader("Admin")
+    if not is_admin():
+        with st.form("login"):
+            lid = st.text_input("Login ID")
+            pw = st.text_input("Password", type="password")
+            if st.form_submit_button("Log in"):
+                if check_login(lid, pw):
+                    st.session_state["admin"] = True
+                    st.rerun()
+                else:
+                    st.error("Wrong ID or password.")
+        return
+
+    if st.button("Log out"):
+        st.session_state["admin"] = False
+        st.rerun()
+    if st.session_state.get("flash"):
+        st.success(st.session_state.pop("flash"))
+
+    st.markdown("#### 1. Saved rates")
+    saved = q("SELECT id, day AS Date, crop AS Crop, market AS Market, price AS Price, "
+              "change AS Change, note AS Note FROM rates ORDER BY day DESC, crop, market")
+    if saved.empty:
+        st.write("No rates saved yet. Use step 2 to add some.")
+    else:
+        saved["Delete"] = False
+        edited = st.data_editor(saved, hide_index=True, disabled=["id", "Date"],
+                                num_rows="fixed", key="editor", width="stretch")
+        if st.button("Save edits"):
+            for _, r in edited.iterrows():
+                if r["Delete"]:
+                    run("DELETE FROM rates WHERE id=?", (int(r["id"]),))
+                elif not pd.isna(r["Price"]) and r["Crop"] and r["Market"]:
+                    run("UPDATE rates SET crop=?,market=?,price=?,change=?,note=? WHERE id=?",
+                        (r["Crop"], r["Market"], float(r["Price"]),
+                         0.0 if pd.isna(r["Change"]) else float(r["Change"]),
+                         "" if pd.isna(r["Note"]) else str(r["Note"]), int(r["id"])))
+            st.session_state["flash"] = "Saved."
+            st.rerun()
+
+    st.markdown("#### 2. Upload or add rates")
+    pub_day = st.date_input("Rates will be saved for the date", value=date.today())
+    st.caption("CSV columns: crop, market, price, change, note (change and note optional)")
+    up = st.file_uploader("CSV file", type=["csv", "txt"])
+    pasted = st.text_area("…or paste rows", placeholder="Wheat,Nashik APMC,2510,40,Regular buyer")
+    text = up.getvalue().decode("utf-8", "ignore") if up else pasted
+    mode = st.selectbox("When publishing", ["Add / update (keep other rates for this date)",
+                                            "Replace all rates for this date"])
+    if st.button("Publish", type="primary"):
+        rows, bad = parse_csv(text or "")
+        if not rows:
+            st.error("No valid rows found.")
+        else:
+            day = pub_day.isoformat()
+            if mode.startswith("Replace"):
+                run("DELETE FROM rates WHERE day=?", (day,))
+            for r in rows:
+                run("DELETE FROM rates WHERE day=? AND lower(crop)=lower(?) AND lower(market)=lower(?)",
+                    (day, r["crop"], r["market"]))
+                run("INSERT INTO rates(day,crop,market,price,change,note) VALUES(?,?,?,?,?,?)",
+                    (day, r["crop"], r["market"], r["price"], r["change"], r["note"]))
+            st.success(f"Published {len(rows)} rates for {day}."
+                       + (f" Skipped bad lines: {bad}." if bad else ""))
+
+
+# ---------------------------------------------------------------- main
+def main():
+    st.set_page_config(page_title="Mandi Rates", page_icon="🌾", layout="centered")
+    st.caption("Maharashtra APMC rates")
+    st.title("Mandi Rates")
+    tabs = st.tabs(["Farmer view", "Buyer requests", "AI help", "Weather", "Admin"])
+    for tab, fn in zip(tabs, [farmer_view, buyer_view, ai_view, weather_view, admin_view]):
+        with tab:
+            fn()
+    st.caption("Rates are entered by the mandi admin. Confirm with the mandi before you travel.")
+
+
+if _name_ == "_main_":
+    main()
